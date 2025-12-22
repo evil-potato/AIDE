@@ -6,6 +6,11 @@ import open_clip
 from .srm_filter_kernel import all_normalized_hpf_list
 import numpy as np
 
+#将输入图像从空间域（像素）转换到残差域（噪声）。将输入图像经过 30 个 Spatial Rich Model (SRM) 滤波器进行卷积计算，并返回提取后的高频特征图
+#冻结权重 (requires_grad=False）。这些 SRM 滤波器使用的是专家经验设计的固定权重，不参与神经网络的训练（反向传播不会更新它们）
+# 过滤掉平滑区域：图像中大面积颜色相近的区域（如蓝天、白墙）在输出中会接近于 0（黑色）。
+# 增强突变区域：图像中的边缘、物体轮廓、以及肉眼难以察觉的像素级“噪声”会被放大。
+# 多维度分析：返回的 30 个通道分别代表了不同的噪声模式（例如：水平方向残差、垂直方向残差、二阶拉普拉斯残差等）。
 class HPF(nn.Module):
   def __init__(self):
     super(HPF, self).__init__()
@@ -225,6 +230,9 @@ class AIDE_Model(nn.Module):
                 else:
                     print(f"Skipping layer {k} because of size mismatch")
         
+        #输入维度2048对应 ResNet-50最后一层全局池化后的特征维度。256对应 ConvNeXt-XLarge最后一层全局池化后的特征维度。两组特征在通道维度上进行拼接（Concatenation）
+        #1024 (隐藏层维度)：MLP 内部第一层会将特征投影到 1024 维的中间表示空间。
+        #2 (输出维度)：代表分类的类别数。在图像取证或医学诊断中，这通常对应 “真/假” 或 “正常/病变” 的二分类任务。
         self.fc = Mlp(2048 + 256 , 1024, 2)
 
         print("build model with convnext_xxl")
@@ -239,10 +247,13 @@ class AIDE_Model(nn.Module):
         self.openclip_convnext_xxl.eval()
         
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        #ConvNeXt-XXL 的输出维度高达 3072。这行代码定义了一个线性层，将 3072 维的高维特征压缩到 256 维。
         self.convnext_proj = nn.Sequential(
             nn.Linear(3072, 256),
 
         )
+        #requires_grad = False: 彻底关闭梯度计算。 这意味着冻结模型的所有参数，在训练过程中不会更新它们的权重。
+        # 模型只学习 convnext_proj 里的线性映射，利用 XXL 模型强大的零样本（Zero-shot）特征提取能力来辅助分类。
         for param in self.openclip_convnext_xxl.parameters():
             param.requires_grad = False
 
@@ -263,6 +274,9 @@ class AIDE_Model(nn.Module):
         x_minmin1 = self.hpf(x_minmin1)
         x_maxmax1 = self.hpf(x_maxmax1)
 
+        # 关键公式: 这里进行了一次在线重正化。因为 tokens 可能是按照 DINOv2 的标准归一化的，但 ConvNeXt-XXL 是基于 CLIP 标准训练的。这个公式将数据从 DINOv2 空间无缝转换到 CLIP 空间。
+        # 特征提取: 提取出 (3072, 8, 8) 的高维空间特征。
+        # 投影 (Projection): 经过全局平均池化（avgpool）和线性映射（convnext_proj），将 3072 维压缩为 256 维 的 x_0。
         with torch.no_grad():
             
             clip_mean = torch.Tensor([0.48145466, 0.4578275, 0.40821073])
@@ -284,8 +298,11 @@ class AIDE_Model(nn.Module):
         x_min1 = self.model_min(x_minmin1)
         x_max1 = self.model_max(x_maxmax1)
 
+        # 特征平均: 将四个分支的输出进行平均，得到一个鲁棒性更强的噪声特征 x_1（维度通常为 2048）。
         x_1 = (x_min + x_max + x_min1 + x_max1) / 4
 
+        # 拼接: 将“大模型的通用视觉理解（x_0）”与“特定任务的噪声纹理（x_1）”强行结合。
+        # 分类: 最终通过 self.fc 输出预测结果。
         x = torch.cat([x_0, x_1], dim=1)
 
         x = self.fc(x)
