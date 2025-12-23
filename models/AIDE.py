@@ -38,7 +38,36 @@ class HPF(nn.Module):
 
     return output
 
+# 增加交叉注意力融合模块
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, query_dim=256, key_dim=2048, embed_dim=512):
+        super().__init__()
+        self.embed_dim = embed_dim
+        
+        # 将不同维度的特征投影到相同的嵌入空间
+        self.q_proj = nn.Linear(query_dim, embed_dim)
+        self.k_proj = nn.Linear(key_dim, embed_dim)
+        self.v_proj = nn.Linear(key_dim, embed_dim)
+        
+        self.att = nn.MultiheadAttention(embed_dim, num_heads=8, batch_first=True)
+        
+        # 最后的输出投影，用于保持特征多样性
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
 
+    def forward(self, query_feat, key_feat):
+        # query_feat: [b, 256], key_feat: [b, 2048]
+        # 增加序列维度以符合 MultiheadAttention 要求: [b, 1, dim]
+        q = self.q_proj(query_feat).unsqueeze(1) 
+        k = self.k_proj(key_feat).unsqueeze(1)
+        v = self.v_proj(key_feat).unsqueeze(1)
+        
+        # 交叉注意力计算
+        attn_out, _ = self.att(q, k, v)
+        
+        # 还原形状并归一化
+        out = self.norm(self.out_proj(attn_out.squeeze(1)))
+        return out
 
 def conv3x3(in_planes, out_planes, stride=1):
     """3x3 convolution with padding"""
@@ -123,11 +152,13 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, num_classes=1000, zero_init_residual=True):
+    # def __init__(self, block, layers, num_classes=1000, zero_init_residual=True):
+    def __init__(self, block, layers, num_classes=1000, zero_init_residual=True, in_channels=30):
         super(ResNet, self).__init__()
 
         self.inplanes = 64
-        self.conv1 = nn.Conv2d(30, 64, kernel_size=7, stride=2, padding=3,
+        # self.conv1 = nn.Conv2d(30, 64, kernel_size=7, stride=2, padding=3,
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3,
                                bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
@@ -216,7 +247,8 @@ class AIDE_Model(nn.Module):
         self.hpf = HPF()
         self.model_min = ResNet(Bottleneck, [3, 4, 6, 3])
         self.model_max = ResNet(Bottleneck, [3, 4, 6, 3])
-       
+        self.model_space = ResNet(Bottleneck, [3, 4, 6, 3], in_channels=3)
+
         if resnet_path is not None:
             pretrained_dict = torch.load(resnet_path, map_location='cpu')
         
@@ -230,10 +262,19 @@ class AIDE_Model(nn.Module):
                 else:
                     print(f"Skipping layer {k} because of size mismatch")
         
+        # 交叉注意力模块
+        # 让 x0 分别与 x1 和 x2 进行交叉
+        self.cross_attn_1 = CrossAttentionFusion(query_dim=256, key_dim=2048, embed_dim=512)
+        self.cross_attn_2 = CrossAttentionFusion(query_dim=256, key_dim=2048, embed_dim=512)
+        # 融合后的维度：
+        # x0 (256) + 交叉特征1 (512) + 交叉特征2 (512)
+        total_fusion_dim = 256 + 512 + 512
+        self.fc = Mlp(total_fusion_dim, 1024, 2)
+
         #输入维度2048对应 ResNet-50最后一层全局池化后的特征维度。256对应 ConvNeXt-XLarge最后一层全局池化后的特征维度。两组特征在通道维度上进行拼接（Concatenation）
         #1024 (隐藏层维度)：MLP 内部第一层会将特征投影到 1024 维的中间表示空间。
         #2 (输出维度)：代表分类的类别数。在图像取证或医学诊断中，这通常对应 “真/假” 或 “正常/病变” 的二分类任务。
-        self.fc = Mlp(2048 + 256 , 1024, 2)
+        # self.fc = Mlp(2048 + 256 + 2048, 1024, 2)
 
         print("build model with convnext_xxl")
         self.openclip_convnext_xxl, _, _ = open_clip.create_model_and_transforms(
@@ -301,9 +342,18 @@ class AIDE_Model(nn.Module):
         # 特征平均: 将四个分支的输出进行平均，得到一个鲁棒性更强的噪声特征 x_1（维度通常为 2048）。
         x_1 = (x_min + x_max + x_min1 + x_max1) / 4
 
-        # 拼接: 将“大模型的通用视觉理解（x_0）”与“特定任务的噪声纹理（x_1）”强行结合。
+        #增加空间域特征
+        x_2 = self.model_space(x[:, 4])
+
+        # 执行交叉注意力融合
+        # 使用大模型语义特征 x_0 去“筛选”残差特征 x_1 和 原始特征 x_2
+        # 得到两个融合后的特征 feat_1 和 feat_2（维度均为 512）。
+        feat_1 = self.cross_attn_1(x_0, x_1)  # [b, 512]
+        feat_2 = self.cross_attn_2(x_0, x_2)  # [b, 512]
+
+        # 拼接: 将“大模型的通用视觉理解（x_0）”与“（feat_1）”和“（feat_2）”在通道维度上进行拼接，形成一个综合特征向量。
         # 分类: 最终通过 self.fc 输出预测结果。
-        x = torch.cat([x_0, x_1], dim=1)
+        x = torch.cat([x_0, feat_1, feat_2], dim=1)
 
         x = self.fc(x)
 
