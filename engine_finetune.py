@@ -50,13 +50,38 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
 
-        if use_amp:
-            with torch.cuda.amp.autocast():
-                output = model(samples)
-                loss = criterion(output, targets)
-        else: # full precision
-            output = model(samples)
-            loss = criterion(output, targets)
+        # 核心修改区域：计算多组合损失
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            outputs = model(samples)
+            
+            if isinstance(outputs, tuple):
+                # 解包：主输出, 辅助噪声输出, 辅助空间输出, 正交损失
+                output, aux_noise, aux_space, ortho_loss = outputs
+                
+                # 1. 主分类损失（自动应用 Label Smoothing 或 Mixup Label）
+                loss_main = criterion(output, targets)
+                
+                # 2. 辅助分类损失（使用同样的 criterion 确保标签平滑逻辑一致）
+                loss_aux_n = criterion(aux_noise, targets)
+                loss_aux_s = criterion(aux_space, targets)
+                
+                # 3. 组合损失：主权重 1.0, 辅助权重 0.3, 正交权重 0.1
+                # 这些权重可以根据 args 传入：args.aux_weight, args.ortho_weight
+                aux_weight = getattr(args, 'aux_weight', 0.3)
+                ortho_weight = getattr(args, 'ortho_weight', 0.1)
+                
+                loss = loss_main + aux_weight * (loss_aux_n + loss_aux_s) + ortho_weight * ortho_loss
+            else:
+                # 兼容旧版本或测试模式
+                loss = criterion(outputs, targets)
+
+        # if use_amp:
+        #     with torch.cuda.amp.autocast():
+        #         output = model(samples)
+        #         loss = criterion(output, targets)
+        # else: # full precision
+        #     output = model(samples)
+        #     loss = criterion(output, targets)
 
         loss_value = loss.item()
 
@@ -91,7 +116,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         else:
             class_acc = None
 
-        metric_logger.update(loss=loss_value)
+        # metric_logger.update(loss=loss_value)
+        metric_logger.update(loss_main=loss_main.item())
+        metric_logger.update(loss_aux_n=loss_aux_n.item())
+        metric_logger.update(loss_aux_s=loss_aux_s.item())
+        metric_logger.update(loss_ortho=ortho_loss.item())
         metric_logger.update(class_acc=class_acc)
         min_lr = 10.
         max_lr = 0.
@@ -109,7 +138,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if use_amp:
             metric_logger.update(grad_norm=grad_norm)
         if log_writer is not None:
-            log_writer.update(loss=loss_value, head="loss")
+            # log_writer.update(loss=loss_value, head="loss")
+            log_writer.update(loss_main=loss_main, head="loss_main")
+            log_writer.update(loss_ortho=ortho_loss, head="loss_ortho")
             log_writer.update(class_acc=class_acc, head="loss")
             log_writer.update(lr=max_lr, head="opt")
             log_writer.update(min_lr=min_lr, head="opt")

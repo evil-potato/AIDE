@@ -4,6 +4,7 @@ import torch
 import clip
 import open_clip
 from .srm_filter_kernel import all_normalized_hpf_list
+import torch.nn.functional as F
 import numpy as np
 
 #将输入图像从空间域（像素）转换到残差域（噪声）。将输入图像经过 30 个 Spatial Rich Model (SRM) 滤波器进行卷积计算，并返回提取后的高频特征图
@@ -68,6 +69,37 @@ class CrossAttentionFusion(nn.Module):
         # 还原形状并归一化
         out = self.norm(self.out_proj(attn_out.squeeze(1)))
         return out
+
+# 增加门控融合模块
+class GatedFusion(nn.Module):
+    def __init__(self, dim_b=256, dim_a=2048, dim_c=2048):
+        super().__init__()
+        # 总维度：256 + 2048 + 2048 = 4352
+        total_dim = dim_b + dim_a + dim_c
+        
+        # 门控网络：计算三路特征的相对重要性
+        self.gate = nn.Sequential(
+            nn.Linear(total_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, 3), # 为三个分支分别输出一个权重
+            nn.Softmax(dim=1)
+        )
+        
+    def forward(self, x_b, x_a, x_c):
+        # x_b: ConvNeXt [b, 256]
+        # x_a: HPF-ResNet [b, 2048]
+        # x_c: Raw-ResNet [b, 2048]
+        
+        combined = torch.cat([x_b, x_a, x_c], dim=1) # [b, 4352]
+        weights = self.gate(combined) # [b, 3]
+        
+        # 应用权重：每个分支乘以其对应的门控权值
+        out_b = x_b * weights[:, 0:1]
+        out_a = x_a * weights[:, 1:2]
+        out_c = x_c * weights[:, 2:3]
+        
+        # 再次拼接作为最终融合特征
+        return torch.cat([out_b, out_a, out_c], dim=1)
 
 def conv3x3(in_planes, out_planes, stride=1):
     """3x3 convolution with padding"""
@@ -264,11 +296,21 @@ class AIDE_Model(nn.Module):
         
         # 交叉注意力模块
         # 让 x0 分别与 x1 和 x2 进行交叉
-        self.cross_attn_1 = CrossAttentionFusion(query_dim=256, key_dim=2048, embed_dim=512)
-        self.cross_attn_2 = CrossAttentionFusion(query_dim=256, key_dim=2048, embed_dim=512)
+        # self.cross_attn_1 = CrossAttentionFusion(query_dim=256, key_dim=2048, embed_dim=512)
+        # self.cross_attn_2 = CrossAttentionFusion(query_dim=256, key_dim=2048, embed_dim=512)
         # 融合后的维度：
         # x0 (256) + 交叉特征1 (512) + 交叉特征2 (512)
-        total_fusion_dim = 256 + 512 + 512
+        # total_fusion_dim = 256 + 512 + 512
+        
+        #门控融合模块
+        # self.fusion_layer = GatedFusion(dim_b=256, dim_a=2048, dim_c=2048)
+        total_fusion_dim = 256 + 2048 + 2048
+
+        # 定义辅助分类器 (Auxiliary Classifiers)
+        # x_1 的维度是 2048, x_2 的维度是 2048
+        self.aux_head_noise = Mlp(2048, 512, 2)
+        self.aux_head_space = Mlp(2048, 512, 2)
+
         self.fc = Mlp(total_fusion_dim, 1024, 2)
 
         #输入维度2048对应 ResNet-50最后一层全局池化后的特征维度。256对应 ConvNeXt-XLarge最后一层全局池化后的特征维度。两组特征在通道维度上进行拼接（Concatenation）
@@ -296,6 +338,18 @@ class AIDE_Model(nn.Module):
         #requires_grad = False: 彻底关闭梯度计算。 这意味着冻结模型的所有参数，在训练过程中不会更新它们的权重。
         # 模型只学习 convnext_proj 里的线性映射，利用 XXL 模型强大的零样本（Zero-shot）特征提取能力来辅助分类。
         for param in self.openclip_convnext_xxl.parameters():
+            param.requires_grad = False
+
+        # 先冻结频域模型和辅助分类头，突击训练空间域模型
+        for param in self.model_min.parameters():
+            param.requires_grad = True
+        for param in self.model_max.parameters():
+            param.requires_grad = True
+        for param in self.aux_head_noise.parameters():
+            param.requires_grad = True
+        for param in self.model_space.parameters():
+            param.requires_grad = False
+        for param in self.aux_head_space.parameters():
             param.requires_grad = False
 
     
@@ -345,19 +399,44 @@ class AIDE_Model(nn.Module):
         #增加空间域特征
         x_2 = self.model_space(x[:, 4])
 
+        # 核心：在训练模式下返回辅助预测值
+        if self.training:
+            aux_noise_out = self.aux_head_noise(x_1)
+            aux_space_out = self.aux_head_space(x_2)
+
         # 执行交叉注意力融合
         # 使用大模型语义特征 x_0 去“筛选”残差特征 x_1 和 原始特征 x_2
         # 得到两个融合后的特征 feat_1 和 feat_2（维度均为 512）。
-        feat_1 = self.cross_attn_1(x_0, x_1)  # [b, 512]
-        feat_2 = self.cross_attn_2(x_0, x_2)  # [b, 512]
+        # feat_1 = self.cross_attn_1(x_0, x_1)  # [b, 512]
+        # feat_2 = self.cross_attn_2(x_0, x_2)  # [b, 512]
 
         # 拼接: 将“大模型的通用视觉理解（x_0）”与“（feat_1）”和“（feat_2）”在通道维度上进行拼接，形成一个综合特征向量。
         # 分类: 最终通过 self.fc 输出预测结果。
-        x = torch.cat([x_0, feat_1, feat_2], dim=1)
+        # x = torch.cat([x_0, feat_1, feat_2], dim=1)
 
+        #执行门控融合
+        # x= self.fusion_layer(x_0, x_1, x_2) # [b, 4352]
+
+        x = torch.cat([x_0, x_1, x_2], dim=1)
         x = self.fc(x)
 
-        return x
+        if self.training:
+            # --- 正交损失 (Orthogonality Loss) ---
+            # 1. 对特征进行 L2 归一化
+            proj_1 = F.normalize(x_1, p=2, dim=1) # [b, 2048]
+            proj_2 = F.normalize(x_2, p=2, dim=1) # [b, 2048]
+            
+            # 2. 计算余弦相似度的绝对值
+            # torch.sum(proj_1 * proj_2, dim=1) 得到每个样本的相似度
+            # 绝对值越接近 0，表示越正交
+            ortho_loss = torch.mean(torch.abs(torch.sum(proj_1 * proj_2, dim=1)))
+            
+            # 返回主输出和两个辅助输出
+            return x, aux_noise_out, aux_space_out, ortho_loss
+        else:
+            return x
+
+        # return x
 
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)

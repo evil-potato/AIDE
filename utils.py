@@ -495,7 +495,12 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
         model_without_ddp.load_state_dict(checkpoint['model'])
         print("Resume checkpoint %s" % args.resume)
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'optimizer' in checkpoint and optimizer is not None:
+                try:
+                    optimizer.load_state_dict(checkpoint['optimizer'])
+                except ValueError:
+                    print("警告：优化器参数组不匹配，已跳过优化器状态加载，将重新初始化优化器。")
+            # optimizer.load_state_dict(checkpoint['optimizer'])
             if not isinstance(checkpoint['epoch'], str): # does not support resuming with 'best', 'best-ema'
                 args.start_epoch = checkpoint['epoch'] + 1
             else:
