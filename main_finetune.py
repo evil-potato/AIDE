@@ -43,15 +43,6 @@ def get_args_parser():
     parser.add_argument('--update_freq', default=1, type=int,
                         help='gradient accumulation steps')
 
-    #SAFE augmentation parameters
-    parser.add_argument('--input_size', default=256, type=int,
-                        help='image input size')
-    parser.add_argument('--jpeg_factor', type=int, default=None)
-    parser.add_argument('--blur_sigma', type=float, default=None)
-    parser.add_argument('--mask_ratio', type=float, default=None)
-    parser.add_argument('--mask_patch_size', type=int, default=None)
-    parser.add_argument('--transform_mode', type=str, default='crop')
-
     # Model parameters
     parser.add_argument('--model', default='AIDE', type=str, metavar='MODEL',
                         help='Name of model to train')

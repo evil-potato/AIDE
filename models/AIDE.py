@@ -62,9 +62,7 @@ def rgb_to_ycbcr(image):
 
 class BayarConv2d(nn.Module):
     """
-    Bayar 约束卷积层。
-    强制中心权重等于周围权重的负和，确保卷积核的总和为 0。
-    这使得该层只能通过高频信号（噪声/伪影），而抑制平滑的内容信号。
+    Bayar 约束卷积层 (修正版)。
     """
     def __init__(self, in_channels, out_channels, kernel_size=5, stride=1, padding=2):
         super(BayarConv2d, self).__init__()
@@ -74,11 +72,11 @@ class BayarConv2d(nn.Module):
         self.stride = stride
         self.padding = padding
         
-        # 初始化权重
-        self.kernel = nn.Parameter(torch.rand(in_channels, out_channels, kernel_size, kernel_size), requires_grad=True)
+        # === 修正点 1: 权重形状必须是 [out_channels, in_channels, k, k] ===
+        self.kernel = nn.Parameter(torch.rand(out_channels, in_channels, kernel_size, kernel_size), requires_grad=True)
         
-        # 创建掩码 (Mask)：中心为 0，其余为 1
-        self.mask = torch.ones(in_channels, out_channels, kernel_size, kernel_size)
+        # === 修正点 2: Mask 形状也要对应修改 ===
+        self.mask = torch.ones(out_channels, in_channels, kernel_size, kernel_size)
         center = kernel_size // 2
         self.mask[:, :, center, center] = 0
         self.mask = nn.Parameter(self.mask, requires_grad=False)
@@ -88,18 +86,18 @@ class BayarConv2d(nn.Module):
         masked_kernel = self.kernel * self.mask
         
         # 2. 计算周围权重的和
-        # sum over kernel dimensions (2, 3)
+        # sum over kernel dimensions (2, 3) -> 也就是 H 和 W 维度
         sum_weights = torch.sum(masked_kernel, dim=(2, 3), keepdim=True)
         
         # 3. 将中心位置设为 -sum，确保整体和为 0
         center = self.kernel_size // 2
-        # 我们需要创建一个临时的 kernel 用于卷积，不能直接修改 self.kernel 否则反向传播会出错
-        # 这里使用 clone 并不是最优，但逻辑最清晰。
-        # 更高效的写法是构造一个只有中心有值的 tensor 减去它
         
         # 构造最终的卷积核
         final_kernel = masked_kernel.clone()
-        final_kernel[:, :, center, center] = -sum_weights.squeeze()
+        
+        # === 修正点 3: 赋值时的维度匹配 ===
+        # sum_weights 的形状是 [out, in, 1, 1]，可以直接赋值给中心点
+        final_kernel[:, :, center, center] = -sum_weights.squeeze(-1).squeeze(-1)
         
         # 执行卷积
         return F.conv2d(x, final_kernel, stride=self.stride, padding=self.padding)
