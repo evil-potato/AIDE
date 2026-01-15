@@ -6,6 +6,91 @@ import open_clip
 from .srm_filter_kernel import all_normalized_hpf_list
 import numpy as np
 import torch.nn.functional as F
+import torch.fft
+import torchvision.transforms.functional as TF
+
+
+# ==========================================
+# [新增] 频谱特征提取器 (Spectral Extractor)
+# ==========================================
+class SpectralExtractor(nn.Module):
+    """
+    输入: RGB Patch [B, 3, H, W]
+    输出: 频域特征向量 [B, out_dim]
+    作用: 提取 Patch 的频域指纹，用于后续的一致性校验。
+    """
+    def __init__(self, out_dim=128):
+        super(SpectralExtractor, self).__init__()
+        
+        # 定义处理频谱图的浅层 CNN
+        # 频谱图具有中心对称性且能量集中在低频，使用大核卷积捕捉全局分布
+        self.conv = nn.Sequential(
+            # Layer 1
+            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            # Layer 2
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            # Layer 3
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            
+            # Global Pooling
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        self.dropout = nn.Dropout(p=0.5) # 强力 Dropout 防止过拟合
+        self.fc = nn.Linear(128, out_dim)
+
+    def forward(self, x):
+        # 1. 快速傅里叶变换 (RFFT)
+        # 输入是实数，使用 rfft2 计算只返回非冗余的一半频谱，效率更高
+        # 输出形状 [B, 3, H, W/2 + 1] (复数)
+        fft = torch.fft.rfft2(x, norm='ortho')
+        
+        # 2. 取幅值 (Modulus)
+        fft_abs = torch.abs(fft)
+        
+        # 3. 对数变换 (Log Transform)
+        # 关键步骤：压缩动态范围，让模型能看清高频的微弱信号
+        # 加 1e-8 防止 log(0)
+        fft_log = torch.log(fft_abs + 1e-8)
+        
+        # 4. CNN 特征提取
+        x = self.conv(fft_log)
+        x = x.flatten(1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+# ==========================================
+# [新增] 语义引导门控 (Semantic Gating)
+# ==========================================
+class SemanticGate(nn.Module):
+    """
+    输入: CLIP 语义特征 [B, sem_dim]
+    输出: 频域注意力权重 [B, freq_dim]
+    作用: 根据内容（如"人脸"或"风景"）动态调整关注的频段
+    """
+    def __init__(self, sem_dim=256, freq_dim=128):
+        super(SemanticGate, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(sem_dim, sem_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(sem_dim // 2, freq_dim),
+            nn.Sigmoid() # 输出 0~1 之间的权重
+        )
+
+    def forward(self, semantic_feat):
+        # 生成门控权重
+        # semantic_feat: [B, 256] -> gate: [B, 128]
+        gate = self.mlp(semantic_feat)
+        return gate
+    
 
 #将输入图像从空间域（像素）转换到残差域（噪声）。将输入图像经过 30 个 Spatial Rich Model (SRM) 滤波器进行卷积计算，并返回提取后的高频特征图
 #冻结权重 (requires_grad=False）。这些 SRM 滤波器使用的是专家经验设计的固定权重，不参与神经网络的训练（反向传播不会更新它们）
@@ -39,120 +124,7 @@ class HPF(nn.Module):
 
     return output
 
-# ==========================================
-# 核心修改部分 1: 定义颜色转换与约束卷积
-# ==========================================
 
-def rgb_to_ycbcr(image):
-    """
-    将 RGB 图像转换为 YCbCr。
-    输入: [B, 3, H, W] (RGB)
-    输出: [B, 3, H, W] (YCbCr)
-    """
-    r = image[:, 0, :, :]
-    g = image[:, 1, :, :]
-    b = image[:, 2, :, :]
-
-    # 标准 JPEG 转换公式
-    y = 0.299 * r + 0.587 * g + 0.114 * b
-    cb = -0.1687 * r - 0.3313 * g + 0.5 * b + 0.5
-    cr = 0.5 * r - 0.4187 * g - 0.0813 * b + 0.5
-
-    return torch.stack([y, cb, cr], dim=1)
-
-class BayarConv2d(nn.Module):
-    """
-    Bayar 约束卷积层 (修正版)。
-    """
-    def __init__(self, in_channels, out_channels, kernel_size=5, stride=1, padding=2):
-        super(BayarConv2d, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        
-        # === 修正点 1: 权重形状必须是 [out_channels, in_channels, k, k] ===
-        self.kernel = nn.Parameter(torch.rand(out_channels, in_channels, kernel_size, kernel_size), requires_grad=True)
-        
-        # === 修正点 2: Mask 形状也要对应修改 ===
-        self.mask = torch.ones(out_channels, in_channels, kernel_size, kernel_size)
-        center = kernel_size // 2
-        self.mask[:, :, center, center] = 0
-        self.mask = nn.Parameter(self.mask, requires_grad=False)
-
-    def forward(self, x):
-        # 1. 对权重应用掩码，将中心置零
-        masked_kernel = self.kernel * self.mask
-        
-        # 2. 计算周围权重的和
-        # sum over kernel dimensions (2, 3) -> 也就是 H 和 W 维度
-        sum_weights = torch.sum(masked_kernel, dim=(2, 3), keepdim=True)
-        
-        # 3. 将中心位置设为 -sum，确保整体和为 0
-        center = self.kernel_size // 2
-        
-        # 构造最终的卷积核
-        final_kernel = masked_kernel.clone()
-        
-        # === 修正点 3: 赋值时的维度匹配 ===
-        # sum_weights 的形状是 [out, in, 1, 1]，可以直接赋值给中心点
-        final_kernel[:, :, center, center] = -sum_weights.squeeze(-1).squeeze(-1)
-        
-        # 执行卷积
-        return F.conv2d(x, final_kernel, stride=self.stride, padding=self.padding)
-    
-# === 新增部分 1: 轻量级空间域特征提取器 ===
-class SpatialExtractor(nn.Module):
-    """
-    组合拳提取器：YCbCr + BayarConv
-    """
-    def __init__(self, out_dim=128):
-        super(SpatialExtractor, self).__init__()
-        
-        # 第一层：BayarConv (约束卷积)，捕捉微观残差
-        # 输入 3 通道 (Y, Cb, Cr)，输出 32 通道噪声特征
-        self.bayar_conv = BayarConv2d(3, 32, kernel_size=5, padding=2)
-        
-        # 后续层：普通 CNN 提取特征
-        self.features = nn.Sequential(
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2), # 256 -> 128
-            
-            # Layer 2
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2), # 128 -> 64
-            
-            # Layer 3
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            
-            # 全局平均池化
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        
-        # 加入 Dropout 防止过拟合
-        self.dropout = nn.Dropout(p=0.5)
-        self.fc = nn.Linear(128, out_dim)
-
-    def forward(self, x):
-        # 1. 颜色空间转换: RGB -> YCbCr
-        # 这一步至关重要，分离亮度和色度伪影
-        x = rgb_to_ycbcr(x)
-        
-        # 2. 约束卷积提取残差
-        x = self.bayar_conv(x)
-        
-        # 3. 常规特征提取
-        x = self.features(x)
-        x = x.flatten(1)
-        x = self.dropout(x)
-        x = self.fc(x)
-        return x
 
 def conv3x3(in_planes, out_planes, stride=1):
     """3x3 convolution with padding"""
@@ -163,6 +135,7 @@ def conv3x3(in_planes, out_planes, stride=1):
 def conv1x1(in_planes, out_planes, stride=1):
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -194,6 +167,7 @@ class BasicBlock(nn.Module):
         out = self.relu(out)
 
         return out
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -328,12 +302,12 @@ class AIDE_Model(nn.Module):
         self.hpf = HPF()
         self.model_min = ResNet(Bottleneck, [3, 4, 6, 3])
         self.model_max = ResNet(Bottleneck, [3, 4, 6, 3])
-        # === 新增部分 2: 初始化空间分支 ===
-        # 这里定义特征维度为 128，你可以根据显存情况调整（64或256）
-        # 使用 128 维特征，配合 BayarConv
-        self.spatial_branch = SpatialExtractor(out_dim=128)
-        # ================================
        
+        # === [新增] 初始化新模块 ===
+        self.spectral_branch = SpectralExtractor(out_dim=128)
+        self.sem_gate = SemanticGate(sem_dim=256, freq_dim=128)
+        # =========================
+
         if resnet_path is not None:
             pretrained_dict = torch.load(resnet_path, map_location='cpu')
         
@@ -351,9 +325,10 @@ class AIDE_Model(nn.Module):
         #1024 (隐藏层维度)：MLP 内部第一层会将特征投影到 1024 维的中间表示空间。
         #2 (输出维度)：代表分类的类别数。在图像取证或医学诊断中，这通常对应 “真/假” 或 “正常/病变” 的二分类任务。
         # self.fc = Mlp(2048 + 256 , 1024, 2)
-        # === 修改部分 3: 调整 MLP 输入维度 ===
-        # 2048 (SRM ResNet特征) + 256 (CLIP特征) + 128 (新增的Spatial特征)
-        self.fc = Mlp(2048 + 256 + 128, 1024, 2)
+
+        # === [修改] FC输入维度 ===
+        # 2048(SRM) + 256(CLIP) + 128(Freq Mean) + 128(Freq Std)
+        self.fc = Mlp(2048 + 256 + 128 + 128, 1024, 2)
 
         print("build model with convnext_xxl")
         self.openclip_convnext_xxl, _, _ = open_clip.create_model_and_transforms(
@@ -377,6 +352,8 @@ class AIDE_Model(nn.Module):
         for param in self.openclip_convnext_xxl.parameters():
             param.requires_grad = False
 
+    
+
     def forward(self, x):
 
         b, t, c, h, w = x.shape
@@ -387,25 +364,9 @@ class AIDE_Model(nn.Module):
         x_maxmax1 = x[:, 3]
         tokens = x[:, 4]
 
-        # === 修改部分 4: 提取空间域特征 ===
-        # 在 HPF 破坏颜色信息之前，将 RGB Patch 传入空间分支
-        # 我们对4个 Patch 分别提取，然后取平均
-        s_min = self.spatial_branch(x_minmin)
-        s_max = self.spatial_branch(x_maxmax)
-        s_min1 = self.spatial_branch(x_minmin1)
-        s_max1 = self.spatial_branch(x_maxmax1)
-        
-        # 得到空间域特征向量 [B, 128]
-        x_spatial = (s_min + s_max + s_min1 + s_max1) / 4
-        # 建议加上 Normalize，防止某个分支特征数值过大主导梯度
-        x_spatial = F.normalize(x_spatial, dim=1)
-        # ================================
-
-        x_minmin = self.hpf(x_minmin)
-        x_maxmax = self.hpf(x_maxmax)
-        x_minmin1 = self.hpf(x_minmin1)
-        x_maxmax1 = self.hpf(x_maxmax1)
-
+        # =========================================================
+        # [Step 1] CLIP 语义提取 (提前执行，为 Gate 做准备)
+        # =========================================================
         # 关键公式: 这里进行了一次在线重正化。因为 tokens 可能是按照 DINOv2 的标准归一化的，但 ConvNeXt-XXL 是基于 CLIP 标准训练的。这个公式将数据从 DINOv2 空间无缝转换到 CLIP 空间。
         # 特征提取: 提取出 (3072, 8, 8) 的高维空间特征。
         # 投影 (Projection): 经过全局平均池化（avgpool）和线性映射（convnext_proj），将 3072 维压缩为 256 维 的 x_0。
@@ -425,8 +386,51 @@ class AIDE_Model(nn.Module):
             local_convnext_image_feats = self.avgpool(local_convnext_image_feats).view(tokens.size(0), -1)
             x_0 = self.convnext_proj(local_convnext_image_feats)
 
-        # 归一化 CLIP 特征
-        x_0 = F.normalize(x_0, dim=1)
+        # 归一化语义特征，供后续融合和Gate使用
+        x_0_norm = F.normalize(x_0, dim=1)
+
+        # =========================================================
+        # [Step 2] 频谱一致性分支 (使用 RGB Patch)
+        # =========================================================
+        # 定义增强函数 (仅针对 FFT 分支)
+        def fft_aug(img):
+            if self.training: 
+                if torch.rand(1) < 0.5: # 随机模糊
+                    sigma = float(torch.rand(1) * 1.9 + 0.1)
+                    img = TF.gaussian_blur(img, kernel_size=5, sigma=[sigma, sigma])
+                if torch.rand(1) < 0.5: # 随机噪声
+                    img = img + torch.randn_like(img) * 0.02
+            return img
+
+        # 提取频谱特征 (使用增强后的 patch)
+        f_min = self.spectral_branch(fft_aug(x_minmin))
+        f_max = self.spectral_branch(fft_aug(x_maxmax))
+        f_min1 = self.spectral_branch(fft_aug(x_minmin1))
+        f_max1 = self.spectral_branch(fft_aug(x_maxmax1))
+
+        # 堆叠 [B, 4, 128]
+        freq_stack = torch.stack([f_min, f_max, f_min1, f_max1], dim=1)
+
+        # 语义门控: 生成权重并加权
+        gate_weights = self.sem_gate(x_0_norm) # [B, 128]
+        gate_weights = gate_weights.unsqueeze(1) # [B, 1, 128]
+        freq_refined = freq_stack * gate_weights
+
+        # 计算一致性
+        freq_mean = torch.mean(freq_refined, dim=1) # 信号特征
+        freq_std = torch.std(freq_refined, dim=1)   # 不一致性特征 (Sanity Check)
+
+        freq_mean = F.normalize(freq_mean, dim=1)
+        freq_std = F.normalize(freq_std, dim=1)
+
+        # =========================================================
+        # [Step 3] SRM 噪声分支 (原逻辑，使用 HPF)
+        # =========================================================
+        # 注意: 这里的 x_minmin 变量会被覆盖为噪声图，所以必须在 Step 2 之后执行
+        x_minmin = self.hpf(x_minmin)
+        x_maxmax = self.hpf(x_maxmax)
+        x_minmin1 = self.hpf(x_minmin1)
+        x_maxmax1 = self.hpf(x_maxmax1)
 
         x_min = self.model_min(x_minmin)
         x_max = self.model_max(x_maxmax)
@@ -435,18 +439,13 @@ class AIDE_Model(nn.Module):
 
         # 特征平均: 将四个分支的输出进行平均，得到一个鲁棒性更强的噪声特征 x_1（维度通常为 2048）。
         x_1 = (x_min + x_max + x_min1 + x_max1) / 4
-        # 归一化 SRM 特征
-        x_1 = F.normalize(x_1, dim=1)
+        x_1 = F.normalize(x_1, dim=1) # 加上归一化更稳健
 
         # 拼接: 将“大模型的通用视觉理解（x_0）”与“特定任务的噪声纹理（x_1）”强行结合。
         # 分类: 最终通过 self.fc 输出预测结果。
         # x = torch.cat([x_0, x_1], dim=1)
-
-        # === 修改部分 5: 融合所有特征 ===
-        # x_0: 语义特征 (256)
-        # x_1: 噪声特征 (2048)
-        # x_spatial: 空间特征 (128)
-        x = torch.cat([x_0, x_1, x_spatial], dim=1)
+        # 拼接: 语义(256) + 噪声(2048) + 频谱均值(128) + 频谱不一致性(128)
+        x = torch.cat([x_0, x_1, freq_mean, freq_std], dim=1)
 
         x = self.fc(x)
 

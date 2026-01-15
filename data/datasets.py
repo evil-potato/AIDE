@@ -32,6 +32,7 @@ Perturbations = K.container.ImageSequential(
 )
 
 transform_before = transforms.Compose([
+    # transforms.Resize([256, 256]),
     transforms.ToTensor(),
     transforms.Lambda(lambda x: Perturbations(x)[0])
     ]
@@ -43,6 +44,7 @@ transform_before_test = transforms.Compose([
 
 transform_train = transforms.Compose([
     transforms.Resize([256, 256]),
+    # transforms.Lambda(lambda x: Perturbations(x)[0]),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
 )
 
@@ -87,8 +89,8 @@ class TrainDataset(Dataset):
                 if '0_real' not in os.listdir(file_path):
                     for folder_name in os.listdir(file_path):
                     
-                        # assert os.listdir(os.path.join(file_path, folder_name)) == ['0_real', '1_fake']
                         assert os.listdir(os.path.join(file_path, folder_name)) == ['1_fake', '0_real']
+                        # assert os.listdir(os.path.join(file_path, folder_name)) == ['0_real', '1_fake']
 
                         for image_path in os.listdir(os.path.join(file_path, folder_name, '0_real')):
                             self.data_list.append({"image_path": os.path.join(file_path, folder_name, '0_real', image_path), "label" : 0})
@@ -199,3 +201,4 @@ class TestDataset(Dataset):
         x_maxmax1 = transform_train(x_maxmax1)
         
         return torch.stack([x_minmin, x_maxmax, x_minmin1, x_maxmax1, x_0], dim=0), torch.tensor(int(targets))
+
