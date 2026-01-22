@@ -52,11 +52,26 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         if use_amp:
             with torch.cuda.amp.autocast():
-                output = model(samples)
-                loss = criterion(output, targets)
+                raw_output = model(samples)
+                if isinstance(raw_output, tuple):
+                    output, k_map, res_map = raw_output
+                    loss_cls = criterion(output, targets)
+                    # 辅助 Loss: 核稀疏 + 残差能量最小化
+                    aux_loss = 0.1 * (torch.mean(torch.abs(k_map)) + torch.mean(torch.abs(res_map)))
+                    loss = loss_cls + aux_loss
+                else:
+                    output = raw_output
+                    loss = criterion(output, targets)
         else: # full precision
-            output = model(samples)
-            loss = criterion(output, targets)
+            raw_output = model(samples)
+            if isinstance(raw_output, tuple):
+                output, k_map, res_map = raw_output
+                loss_cls = criterion(output, targets)
+                aux_loss = 0.1 * (torch.mean(torch.abs(k_map)) + torch.mean(torch.abs(res_map)))
+                loss = loss_cls + aux_loss
+            else:
+                output = raw_output
+                loss = criterion(output, targets)
 
         loss_value = loss.item()
 
@@ -92,6 +107,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             class_acc = None
 
         metric_logger.update(loss=loss_value)
+        metric_logger.update(loss_cls=loss_cls)
+        metric_logger.update(aux_loss=aux_loss)
         metric_logger.update(class_acc=class_acc)
         min_lr = 10.
         max_lr = 0.
@@ -110,6 +127,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             metric_logger.update(grad_norm=grad_norm)
         if log_writer is not None:
             log_writer.update(loss=loss_value, head="loss")
+            log_writer.update(loss_cls=loss_cls, head="loss_cls")
+            log_writer.update(aux_loss=aux_loss, head="aux_loss")
             log_writer.update(class_acc=class_acc, head="loss")
             log_writer.update(lr=max_lr, head="opt")
             log_writer.update(min_lr=min_lr, head="opt")
@@ -151,8 +170,12 @@ def evaluate(data_loader, model, device, use_amp=False):
             output = model(images) #[bs, num_cls]
             if isinstance(output, dict):
                 output = output['logits']
-            
-            loss = criterion(output, target)
+
+        # 兼容处理：确保 evaluate 永远拿到 logits
+        if isinstance(output, tuple): output = output[0]
+        if isinstance(output, dict): output = output['logits']
+
+        loss = criterion(output, target)
         
         if index == 0:
             predictions = output

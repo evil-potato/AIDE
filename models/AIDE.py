@@ -6,124 +6,9 @@ import open_clip
 from .srm_filter_kernel import all_normalized_hpf_list
 import numpy as np
 import torch.nn.functional as F
+import torchvision.models as models
 import torch.fft
 import torchvision.transforms.functional as TF
-
-
-# ==========================================
-# [新增] 频谱特征提取器 (Spectral Extractor)
-# ==========================================
-class SpectralExtractor(nn.Module):
-    """
-    输入: RGB Patch [B, 3, H, W]
-    输出: 频域特征向量 [B, out_dim]
-    作用: 提取 Patch 的频域指纹，用于后续的一致性校验。
-    """
-    def __init__(self, out_dim=128):
-        super(SpectralExtractor, self).__init__()
-        
-        # 定义处理频谱图的浅层 CNN
-        # 频谱图具有中心对称性且能量集中在低频，使用大核卷积捕捉全局分布
-        self.conv = nn.Sequential(
-            # Layer 1
-            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            
-            # Layer 2
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            
-            # Layer 3
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            
-            # Global Pooling
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        self.dropout = nn.Dropout(p=0.5) # 强力 Dropout 防止过拟合
-        self.fc = nn.Linear(128, out_dim)
-
-    def forward(self, x):
-        # 1. 快速傅里叶变换 (RFFT)
-        # 输入是实数，使用 rfft2 计算只返回非冗余的一半频谱，效率更高
-        # 输出形状 [B, 3, H, W/2 + 1] (复数)
-        fft = torch.fft.rfft2(x, norm='ortho')
-        
-        # 2. 取幅值 (Modulus)
-        fft_abs = torch.abs(fft)
-        
-        # 3. 对数变换 (Log Transform)
-        # 关键步骤：压缩动态范围，让模型能看清高频的微弱信号
-        # 加 1e-8 防止 log(0)
-        fft_log = torch.log(fft_abs + 1e-8)
-        
-        # 4. CNN 特征提取
-        x = self.conv(fft_log)
-        x = x.flatten(1)
-        x = self.dropout(x)
-        x = self.fc(x)
-        return x
-
-# ==========================================
-# [新增] 语义引导门控 (Semantic Gating)
-# ==========================================
-class SemanticGate(nn.Module):
-    """
-    输入: CLIP 语义特征 [B, sem_dim]
-    输出: 频域注意力权重 [B, freq_dim]
-    作用: 根据内容（如"人脸"或"风景"）动态调整关注的频段
-    """
-    def __init__(self, sem_dim=256, freq_dim=128):
-        super(SemanticGate, self).__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(sem_dim, sem_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(sem_dim // 2, freq_dim),
-            nn.Sigmoid() # 输出 0~1 之间的权重
-        )
-
-    def forward(self, semantic_feat):
-        # 生成门控权重
-        # semantic_feat: [B, 256] -> gate: [B, 128]
-        gate = self.mlp(semantic_feat)
-        return gate
-    
-
-#将输入图像从空间域（像素）转换到残差域（噪声）。将输入图像经过 30 个 Spatial Rich Model (SRM) 滤波器进行卷积计算，并返回提取后的高频特征图
-#冻结权重 (requires_grad=False）。这些 SRM 滤波器使用的是专家经验设计的固定权重，不参与神经网络的训练（反向传播不会更新它们）
-# 过滤掉平滑区域：图像中大面积颜色相近的区域（如蓝天、白墙）在输出中会接近于 0（黑色）。
-# 增强突变区域：图像中的边缘、物体轮廓、以及肉眼难以察觉的像素级“噪声”会被放大。
-# 多维度分析：返回的 30 个通道分别代表了不同的噪声模式（例如：水平方向残差、垂直方向残差、二阶拉普拉斯残差等）。
-class HPF(nn.Module):
-  def __init__(self):
-    super(HPF, self).__init__()
-
-    #Load 30 SRM Filters
-    all_hpf_list_5x5 = []
-
-    for hpf_item in all_normalized_hpf_list:
-      if hpf_item.shape[0] == 3:
-        hpf_item = np.pad(hpf_item, pad_width=((1, 1), (1, 1)), mode='constant')
-
-      all_hpf_list_5x5.append(hpf_item)
-
-    hpf_weight = torch.Tensor(all_hpf_list_5x5).view(30, 1, 5, 5).contiguous()
-    hpf_weight = torch.nn.Parameter(hpf_weight.repeat(1, 3, 1, 1), requires_grad=False)
-   
-
-    self.hpf = nn.Conv2d(3, 30, kernel_size=5, padding=2, bias=False)
-    self.hpf.weight = hpf_weight
-
-
-  def forward(self, input):
-
-    output = self.hpf(input)
-
-    return output
-
 
 
 def conv3x3(in_planes, out_planes, stride=1):
@@ -276,6 +161,92 @@ class ResNet(nn.Module):
 
         return x
 
+# ==========================================
+# Part 3: Z域分析组件 (针对 30 通道优化)
+# ==========================================
+
+class KernelEstimator(nn.Module):
+    def __init__(self, kernel_size=5):
+        super(KernelEstimator, self).__init__()
+        self.kernel_size = kernel_size
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool2d((1, 1))
+        )
+        self.regressor = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128, kernel_size * kernel_size),
+            nn.Tanh()
+        )
+    def forward(self, x):
+        k = self.regressor(self.features(x))
+        return k.view(x.size(0), 1, self.kernel_size, self.kernel_size)
+
+class ResidualExtraction(nn.Module):
+    def __init__(self, kernel_size):
+        super(ResidualExtraction, self).__init__()
+        self.kernel_size = kernel_size
+        self.pad = kernel_size // 2
+    def forward(self, img, kernel):
+        B, C, H, W = img.shape
+        img_reshape = img.contiguous().view(1, B*C, H, W)
+        kernel_repeat = kernel.repeat(1, C, 1, 1).view(B*C, 1, self.kernel_size, self.kernel_size)
+        blurred = F.conv2d(img_reshape, kernel_repeat, padding=self.pad, groups=B*C)
+        return img - blurred.view(B, C, H, W)
+
+class DenseZScanLayer(nn.Module):
+    def __init__(self, num_channels=30):
+        super(DenseZScanLayer, self).__init__()
+        self.num_channels = num_channels
+        
+        # === 核心修改: 生成 30 个 Z 域半径 ===
+        # 范围覆盖 0.85 (强衰减) 到 1.15 (强发散)
+        # 这相当于对 Z 平面进行密集的环形扫描
+        self.radii = np.linspace(0.85, 1.15, num_channels) 
+
+    def compute_z_slice(self, img, r):
+        # img: [B, 1, H, W] (灰度残差)
+        B, _, H, W = img.shape
+        device = img.device
+        
+        # 径向权重 W = r^(-dist_from_center)
+        y = torch.arange(H, device=device).view(1, 1, H, 1) - H//2
+        x = torch.arange(W, device=device).view(1, 1, 1, W) - W//2
+        dist = torch.sqrt(x**2 + y**2) / (H//2) # 归一化距离
+        
+        # 权重计算 (r > 1 放大边缘，r < 1 放大中心)
+        # 使用 pow(r, -n) 形式
+        weight = torch.pow(r, -dist * 10) 
+        
+        # 加权 + FFT
+        fft = torch.fft.fft2(img * weight)
+        fft_shift = torch.fft.fftshift(fft)
+        spec = torch.log(torch.abs(fft_shift) + 1e-6)
+        
+        # 抑制中心直流分量 (DC Suppression)
+        cy, cx = H // 2, W // 2
+        spec[:, :, cy-1:cy+2, cx-1:cx+2] = 0
+
+        return spec
+
+    def forward(self, x):
+        # x: Residual [B, 3, H, W] -> 转灰度 -> [B, 1, H, W]
+        x_gray = torch.mean(x, dim=1, keepdim=True)
+        
+        specs = []
+        for r in self.radii:
+            s = self.compute_z_slice(x_gray, r)
+            specs.append(s)
+            
+        # 拼接成 [B, 30, H, W] 以匹配 ResNet 输入
+        out = torch.cat(specs, dim=1)
+        
+        # 归一化
+        mean = out.mean(dim=(2, 3), keepdim=True)
+        std = out.std(dim=(2, 3), keepdim=True)
+        return (out - mean) / (std + 1e-5)
+
 class Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
     """
@@ -299,36 +270,39 @@ class AIDE_Model(nn.Module):
 
     def __init__(self, resnet_path, convnext_path):
         super(AIDE_Model, self).__init__()
-        self.hpf = HPF()
-        self.model_min = ResNet(Bottleneck, [3, 4, 6, 3])
-        self.model_max = ResNet(Bottleneck, [3, 4, 6, 3])
-       
-        # === [新增] 初始化新模块 ===
-        self.spectral_branch = SpectralExtractor(out_dim=128)
-        self.sem_gate = SemanticGate(sem_dim=256, freq_dim=128)
-        # =========================
-
-        if resnet_path is not None:
-            pretrained_dict = torch.load(resnet_path, map_location='cpu')
+        # 1. 前端处理
+        self.kernel_net = KernelEstimator(kernel_size=7)
+        self.res_layer = ResidualExtraction(kernel_size=7)
         
-            model_min_dict = self.model_min.state_dict()
-            model_max_dict = self.model_max.state_dict()
-    
-            for k in pretrained_dict.keys():
-                if k in model_min_dict and pretrained_dict[k].size() == model_min_dict[k].size():
-                    model_min_dict[k] = pretrained_dict[k]
-                    model_max_dict[k] = pretrained_dict[k]
-                else:
-                    print(f"Skipping layer {k} because of size mismatch")
+        # 2. Z域扫描 (输出 30 通道)
+        self.z_layer = DenseZScanLayer(num_channels=30)
         
-        #输入维度2048对应 ResNet-50最后一层全局池化后的特征维度。256对应 ConvNeXt-XLarge最后一层全局池化后的特征维度。两组特征在通道维度上进行拼接（Concatenation）
-        #1024 (隐藏层维度)：MLP 内部第一层会将特征投影到 1024 维的中间表示空间。
-        #2 (输出维度)：代表分类的类别数。在图像取证或医学诊断中，这通常对应 “真/假” 或 “正常/病变” 的二分类任务。
-        # self.fc = Mlp(2048 + 256 , 1024, 2)
+        # 3. 你的 ResNet (作为 Backbone)
+        # 使用 ResNet50 的配置 (Bottleneck, [3, 4, 6, 3])
+        # 输入通道已在 CustomResNet 内部设为 30
+        # 适配层 (30 -> 3): 让 Z 域特征能利用 ResNet 预训练权重
+        self.adapter = nn.Conv2d(30, 3, kernel_size=1, bias=False)
+        nn.init.kaiming_normal_(self.adapter.weight, mode='fan_out', nonlinearity='relu')
 
-        # === [修改] FC输入维度 ===
-        # 2048(SRM) + 256(CLIP) + 128(Freq Mean) + 128(Freq Std)
-        self.fc = Mlp(2048 + 256 + 128 + 128, 1024, 2)
+        # 使用标准 torchvision ResNet50
+        self.backbone = models.resnet50(pretrained=False)
+
+        # 加载 ResNet 权重
+        if resnet_path:
+            print(f"Loading ResNet weights from {resnet_path}")
+            try:
+                state_dict = torch.load(resnet_path, map_location='cpu')
+                # 过滤不匹配的层 (如 fc)
+                model_dict = self.backbone.state_dict()
+                state_dict = {k: v for k, v in state_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+                self.backbone.load_state_dict(state_dict, strict=False)
+            except Exception as e:
+                print(f"Error loading ResNet weights: {e}")
+        else:
+            print("Warning: resnet_path is None. Using random init.")
+
+        # 移除 FC 层，只取特征
+        self.backbone.fc = nn.Identity()
 
         print("build model with convnext_xxl")
         self.openclip_convnext_xxl, _, _ = open_clip.create_model_and_transforms(
@@ -352,21 +326,22 @@ class AIDE_Model(nn.Module):
         for param in self.openclip_convnext_xxl.parameters():
             param.requires_grad = False
 
+        #输入维度2048对应 ResNet-50最后一层全局池化后的特征维度。256对应 ConvNeXt-XLarge最后一层全局池化后的特征维度。两组特征在通道维度上进行拼接（Concatenation）
+        #1024 (隐藏层维度)：MLP 内部第一层会将特征投影到 1024 维的中间表示空间。
+        #2 (输出维度)：代表分类的类别数。在图像取证或医学诊断中，这通常对应 “真/假” 或 “正常/病变” 的二分类任务。
+        # self.fc = Mlp(2048 + 256 , 1024, 2)
+
+        # === [修改] FC输入维度 ===
+        self.fc = Mlp(2048 + 256, 1024, 2)
+
     
 
     def forward(self, x):
 
         b, t, c, h, w = x.shape
 
-        x_minmin = x[:, 0] #[b, c, h, w]
-        x_maxmax = x[:, 1]
-        x_minmin1 = x[:, 2]
-        x_maxmax1 = x[:, 3]
         tokens = x[:, 4]
 
-        # =========================================================
-        # [Step 1] CLIP 语义提取 (提前执行，为 Gate 做准备)
-        # =========================================================
         # 关键公式: 这里进行了一次在线重正化。因为 tokens 可能是按照 DINOv2 的标准归一化的，但 ConvNeXt-XXL 是基于 CLIP 标准训练的。这个公式将数据从 DINOv2 空间无缝转换到 CLIP 空间。
         # 特征提取: 提取出 (3072, 8, 8) 的高维空间特征。
         # 投影 (Projection): 经过全局平均池化（avgpool）和线性映射（convnext_proj），将 3072 维压缩为 256 维 的 x_0。
@@ -386,70 +361,31 @@ class AIDE_Model(nn.Module):
             local_convnext_image_feats = self.avgpool(local_convnext_image_feats).view(tokens.size(0), -1)
             x_0 = self.convnext_proj(local_convnext_image_feats)
 
-        # 归一化语义特征，供后续融合和Gate使用
-        x_0_norm = F.normalize(x_0, dim=1)
 
-        # =========================================================
-        # [Step 2] 频谱一致性分支 (使用 RGB Patch)
-        # =========================================================
-        # 定义增强函数 (仅针对 FFT 分支)
-        def fft_aug(img):
-            if self.training: 
-                if torch.rand(1) < 0.5: # 随机模糊
-                    sigma = float(torch.rand(1) * 1.9 + 0.1)
-                    img = TF.gaussian_blur(img, kernel_size=5, sigma=[sigma, sigma])
-                if torch.rand(1) < 0.5: # 随机噪声
-                    img = img + torch.randn_like(img) * 0.02
-            return img
+        # A. 估计核
+        k = self.kernel_net(x[:, 4])
+        
+        # B. 提取残差
+        res = self.res_layer(x[:, 4], k)
+        
+        # C. 30层 Z 域扫描 [B, 30, H, W]
+        z_stack = self.z_layer(res)
+        z_adapted = self.adapter(z_stack)# 4. 适配 (30->3通道)
 
-        # 提取频谱特征 (使用增强后的 patch)
-        f_min = self.spectral_branch(fft_aug(x_minmin))
-        f_max = self.spectral_branch(fft_aug(x_maxmax))
-        f_min1 = self.spectral_branch(fft_aug(x_minmin1))
-        f_max1 = self.spectral_branch(fft_aug(x_maxmax1))
-
-        # 堆叠 [B, 4, 128]
-        freq_stack = torch.stack([f_min, f_max, f_min1, f_max1], dim=1)
-
-        # 语义门控: 生成权重并加权
-        gate_weights = self.sem_gate(x_0_norm) # [B, 128]
-        gate_weights = gate_weights.unsqueeze(1) # [B, 1, 128]
-        freq_refined = freq_stack * gate_weights
-
-        # 计算一致性
-        freq_mean = torch.mean(freq_refined, dim=1) # 信号特征
-        freq_std = torch.std(freq_refined, dim=1)   # 不一致性特征 (Sanity Check)
-
-        freq_mean = F.normalize(freq_mean, dim=1)
-        freq_std = F.normalize(freq_std, dim=1)
-
-        # =========================================================
-        # [Step 3] SRM 噪声分支 (原逻辑，使用 HPF)
-        # =========================================================
-        # 注意: 这里的 x_minmin 变量会被覆盖为噪声图，所以必须在 Step 2 之后执行
-        x_minmin = self.hpf(x_minmin)
-        x_maxmax = self.hpf(x_maxmax)
-        x_minmin1 = self.hpf(x_minmin1)
-        x_maxmax1 = self.hpf(x_maxmax1)
-
-        x_min = self.model_min(x_minmin)
-        x_max = self.model_max(x_maxmax)
-        x_min1 = self.model_min(x_minmin1)
-        x_max1 = self.model_max(x_maxmax1)
-
-        # 特征平均: 将四个分支的输出进行平均，得到一个鲁棒性更强的噪声特征 x_1（维度通常为 2048）。
-        x_1 = (x_min + x_max + x_min1 + x_max1) / 4
-        x_1 = F.normalize(x_1, dim=1) # 加上归一化更稳健
+        # D. ResNet 特征提取 [B, 2048]
+        features = self.backbone(z_adapted)
 
         # 拼接: 将“大模型的通用视觉理解（x_0）”与“特定任务的噪声纹理（x_1）”强行结合。
         # 分类: 最终通过 self.fc 输出预测结果。
-        # x = torch.cat([x_0, x_1], dim=1)
-        # 拼接: 语义(256) + 噪声(2048) + 频谱均值(128) + 频谱不一致性(128)
-        x = torch.cat([x_0, x_1, freq_mean, freq_std], dim=1)
+        x = torch.cat([x_0, features], dim=1)
 
         x = self.fc(x)
 
-        return x
+        # [关键修改] 训练模式下返回辅助信息
+        if self.training:
+            return x, k, res
+        else:
+            return x
 
 def AIDE(resnet_path, convnext_path):
     model = AIDE_Model(resnet_path, convnext_path)
